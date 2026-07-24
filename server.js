@@ -750,8 +750,9 @@ function seedMockAuction({ log = () => {
     { title: "Blackhawk Serpa Holster + Range Bag", category: "accessory", startPrice: 30, reserve: null, description: "Gently used holster and tactical range bag." }
   ];
   if (store._state.lots.size === 0) {
-    lots.forEach((l, i) => store.addLot({ ...l, startTime: now2, endTime: now2 + (3 + i * 2) * MIN }));
-    log(`Seeded ${lots.length} lots (staggered closings, first at ~3 min).`);
+    const HOUR = 60 * MIN;
+    lots.forEach((l, i) => store.addLot({ ...l, startTime: now2, endTime: now2 + (2 + i * 2) * HOUR }));
+    log(`Seeded ${lots.length} lots (staggered closings, first at ~2 hours).`);
   } else {
     log("Lots already present; leaving them as-is.");
   }
