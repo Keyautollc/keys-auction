@@ -1,0 +1,24 @@
+# Render Blueprint — auto-deploys this repo as a Web Service.
+# In Render: New + -> Blueprint -> connect this GitHub repo. Render reads this file
+# and creates the service. Every push to the branch redeploys.
+services:
+  - type: web
+    name: keys-auction
+    runtime: node
+    plan: starter            # free plan also works but sleeps when idle
+    branch: main
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /healthz
+    autoDeploy: true
+    envVars:
+      - key: SESSION_SECRET
+        generateValue: true   # Render generates a strong secret
+      - key: EMAIL_TRANSPORT
+        value: console        # switch to "smtp" + SMTP_* once you have a mailbox
+      - key: PERSIST_TO_DISK
+        value: "false"        # use a database in production (see README)
+      - key: SEED_ON_BOOT
+        value: "true"         # loads the private mock auction so there's plenty to click
+      - key: PUBLIC_BASE_URL
+        value: ""             # set to https://bid.keysgunshop.com after you add the domain
