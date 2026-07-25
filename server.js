@@ -32,6 +32,9 @@ var config = {
     email: process.env.BOOTSTRAP_STAFF_EMAIL || "",
     password: process.env.BOOTSTRAP_STAFF_PASSWORD || ""
   },
+  // Postgres connection string. When set, the store persists to the database
+  // (durable) instead of / in addition to the local file snapshot.
+  databaseUrl: process.env.DATABASE_URL || "",
   persistToDisk: bool(process.env.PERSIST_TO_DISK, true),
   // Auto-load a private mock auction on boot if the catalog is empty. Handy for a
   // first live deploy so there's something to click without running the seed CLI.
@@ -344,6 +347,77 @@ var REASON_MESSAGES = {
   invalid_amount: "Enter a valid whole-dollar amount."
 };
 
+// src/store/persistence.js
+import pg from "pg";
+var pool = null;
+var ready = false;
+var latest = null;
+var writing = false;
+var enabled = () => !!config.databaseUrl;
+function needSsl(url) {
+  if (/localhost|127\.0\.0\.1/.test(url)) return false;
+  return /render\.com|amazonaws|neon\.tech|supabase|sslmode=require/.test(url) || true;
+}
+async function init() {
+  if (!config.databaseUrl) return false;
+  pool = new pg.Pool({
+    connectionString: config.databaseUrl,
+    ssl: needSsl(config.databaseUrl) ? { rejectUnauthorized: false } : false,
+    max: 5,
+    idleTimeoutMillis: 3e4
+  });
+  await pool.query(
+    "CREATE TABLE IF NOT EXISTS app_state (id int PRIMARY KEY, data jsonb NOT NULL, updated_at bigint)"
+  );
+  ready = true;
+  console.log("[persist] PostgreSQL connected");
+  return true;
+}
+async function load() {
+  if (!ready) return null;
+  const r = await pool.query("SELECT data FROM app_state WHERE id = 1");
+  return r.rows[0]?.data ?? null;
+}
+async function writeOnce(data) {
+  await pool.query(
+    `INSERT INTO app_state (id, data, updated_at) VALUES (1, $1::jsonb, $2)
+     ON CONFLICT (id) DO UPDATE SET data = EXCLUDED.data, updated_at = EXCLUDED.updated_at`,
+    [JSON.stringify(data), Date.now()]
+  );
+}
+async function flush() {
+  if (writing) return;
+  writing = true;
+  try {
+    while (latest) {
+      const data = latest;
+      latest = null;
+      await writeOnce(data);
+    }
+  } catch (e) {
+    console.error("[persist] write failed:", e.message);
+  } finally {
+    writing = false;
+    if (latest) flush();
+  }
+}
+function save(stateObj) {
+  if (!ready) return;
+  latest = stateObj;
+  flush();
+}
+async function shutdown() {
+  try {
+    if (ready && latest) await writeOnce(latest);
+  } catch (e) {
+    console.error("[persist] shutdown flush failed:", e.message);
+  }
+  try {
+    await pool?.end();
+  } catch {
+  }
+}
+
 // src/store/memoryStore.js
 var __dirname = path.dirname(fileURLToPath(import.meta.url));
 var SNAPSHOT = path.join(__dirname, "..", "..", "data", "snapshot.json");
@@ -359,34 +433,54 @@ var state = {
   invoices: /* @__PURE__ */ new Map(),
   sales: /* @__PURE__ */ new Map()
 };
-function save() {
-  if (!config.persistToDisk) return;
-  const dump = {
+function serialize() {
+  return {
     users: [...state.users.values()],
     lots: [...state.lots.values()],
     bidsByLot: [...state.bidsByLot.entries()],
     events: state.events,
     invoices: [...state.invoices.values()],
-    sales: [...state.sales.values()]
+    sales: [...state.sales.values()],
+    sessions: [...state.sessions.entries()]
   };
+}
+function hydrate(dump) {
+  if (!dump) return false;
+  state.users = new Map((dump.users || []).map((u) => [u.id, u]));
+  state.lots = new Map((dump.lots || []).map((l) => [l.id, l]));
+  state.bidsByLot = new Map(dump.bidsByLot || []);
+  state.events = dump.events || [];
+  state.invoices = new Map((dump.invoices || []).map((i) => [i.id, i]));
+  state.sales = new Map((dump.sales || []).map((s) => [s.id, s]));
+  state.sessions = new Map(dump.sessions || []);
+  return true;
+}
+function save2() {
+  if (enabled()) {
+    save(serialize());
+    return;
+  }
+  if (!config.persistToDisk) return;
   try {
     fs.mkdirSync(path.dirname(SNAPSHOT), { recursive: true });
-    fs.writeFileSync(SNAPSHOT, JSON.stringify(dump));
+    fs.writeFileSync(SNAPSHOT, JSON.stringify(serialize()));
   } catch (e) {
     console.error("[store] snapshot save failed:", e.message);
   }
 }
-function load() {
+async function loadState() {
+  if (enabled()) {
+    try {
+      await init();
+      return hydrate(await load());
+    } catch (e) {
+      console.error("[store] db load failed:", e.message);
+      return false;
+    }
+  }
   if (!config.persistToDisk || !fs.existsSync(SNAPSHOT)) return false;
   try {
-    const dump = JSON.parse(fs.readFileSync(SNAPSHOT, "utf8"));
-    state.users = new Map(dump.users.map((u) => [u.id, u]));
-    state.lots = new Map(dump.lots.map((l) => [l.id, l]));
-    state.bidsByLot = new Map(dump.bidsByLot);
-    state.events = dump.events || [];
-    state.invoices = new Map((dump.invoices || []).map((i) => [i.id, i]));
-    state.sales = new Map((dump.sales || []).map((s) => [s.id, s]));
-    return true;
+    return hydrate(JSON.parse(fs.readFileSync(SNAPSHOT, "utf8")));
   } catch (e) {
     console.error("[store] snapshot load failed:", e.message);
     return false;
@@ -460,7 +554,7 @@ function placeBid({ lotId, userId, maxAmount }) {
   state.bidsByLot.set(lotId, [...bids, res.bid]);
   Object.assign(lot, res.patch);
   for (const evt of res.events) logEvent(evt);
-  save();
+  save2();
   return {
     ok: true,
     lot: publicLot(lot),
@@ -489,7 +583,7 @@ function tick() {
       changed.push(lot.id);
     }
   }
-  if (changed.length) save();
+  if (changed.length) save2();
   return { changed, now: now2 };
 }
 function createInvoiceForSale(lot) {
@@ -521,10 +615,14 @@ function createInvoiceForSale(lot) {
   return inv;
 }
 var store = {
-  init() {
-    load();
+  async init() {
+    await loadState();
     bootstrapStaff();
-    save();
+    save2();
+  },
+  // Best-effort final flush of pending writes on shutdown.
+  async shutdown() {
+    await shutdown();
   },
   _state: state,
   // for tests/tools only
@@ -554,7 +652,7 @@ var store = {
     };
     state.users.set(user.id, user);
     logEvent({ type: "BIDDER_REGISTERED", at: user.createdAt, userId: user.id, email });
-    save();
+    save2();
     return { ok: true, user: publicUser(user), verifyToken: token };
   },
   verifyEmail(token) {
@@ -563,7 +661,7 @@ var store = {
     user.emailVerified = true;
     user.verifyToken = void 0;
     logEvent({ type: "EMAIL_VERIFIED", at: now(), userId: user.id });
-    save();
+    save2();
     return { ok: true, user: publicUser(user) };
   },
   authenticate(email, password) {
@@ -602,7 +700,7 @@ var store = {
     u.status = "approved";
     if (biddingLimit != null) u.biddingLimit = biddingLimit;
     logEvent({ type: "BIDDER_APPROVED", at: now(), userId, biddingLimit: u.biddingLimit });
-    save();
+    save2();
     return { ok: true, user: publicUser(u) };
   },
   setBidderStatus(userId, status) {
@@ -613,7 +711,7 @@ var store = {
     }
     u.status = status;
     logEvent({ type: "BIDDER_STATUS_SET", at: now(), userId, status });
-    save();
+    save2();
     return { ok: true, user: publicUser(u) };
   },
   setBiddingLimit(userId, limit) {
@@ -621,7 +719,7 @@ var store = {
     if (!u || u.role !== "bidder") return { ok: false, error: "not_found" };
     u.biddingLimit = limit == null ? null : Number(limit);
     logEvent({ type: "BIDDING_LIMIT_SET", at: now(), userId, limit: u.biddingLimit });
-    save();
+    save2();
     return { ok: true, user: publicUser(u) };
   },
   // --- lots ---
@@ -650,7 +748,7 @@ var store = {
       soldPrice: null
     };
     state.lots.set(l.id, l);
-    save();
+    save2();
     return l;
   },
   getLot(id) {
@@ -687,7 +785,7 @@ var store = {
     if (!inv) return { ok: false, error: "not_found" };
     Object.assign(inv, patch);
     logEvent({ type: "INVOICE_UPDATED", at: now(), invoiceId: id, patch });
-    save();
+    save2();
     return { ok: true, invoice: inv };
   },
   // Staff override: void a bid history entry / cancel a sale for compliance.
@@ -700,7 +798,7 @@ var store = {
     const inv = [...state.invoices.values()].find((i) => i.lotId === lotId);
     if (inv) inv.status = "voided";
     logEvent({ type: "LOT_VOIDED", at: now(), lotId, reason });
-    save();
+    save2();
     return { ok: true };
   },
   auditLog(limit = 200) {
@@ -1021,7 +1119,7 @@ apiRouter.get("/staff/audit", requireStaff, (req, res) => res.json({ events: sto
 
 // src/server.js
 var __dirname2 = path2.dirname(fileURLToPath2(import.meta.url));
-store.init();
+await store.init();
 if (config.seedOnBoot) seedMockAuction({ log: (m) => console.log("[seed]", m) });
 var app = express3();
 app.disable("x-powered-by");
@@ -1053,3 +1151,13 @@ server.listen(config.port, () => {
   console.log(`Keys Gun Shop Auctions listening on http://localhost:${config.port}`);
   console.log(`Public base URL: ${config.publicBaseUrl}`);
 });
+for (const sig of ["SIGTERM", "SIGINT"]) {
+  process.on(sig, async () => {
+    console.log(`[server] ${sig} received \u2014 flushing store...`);
+    try {
+      await store.shutdown();
+    } catch {
+    }
+    process.exit(0);
+  });
+}
