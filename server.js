@@ -490,21 +490,27 @@ function logEvent(evt) {
   state.events.push({ id: uuid(), ...evt });
 }
 function bootstrapStaff() {
-  const hasStaff = [...state.users.values()].some((u) => u.role === "staff");
   const { email, password } = config.bootstrapStaff;
-  if (hasStaff || !email || !password) return;
-  const user = {
-    id: uuid(),
-    email: email.toLowerCase(),
-    name: "Shop Owner",
-    role: "staff",
-    passwordHash: hashPassword(password),
-    status: "approved",
-    emailVerified: true,
-    createdAt: now()
-  };
-  state.users.set(user.id, user);
-  console.log(`[store] bootstrap staff account created: ${email}`);
+  if (!email || !password) return;
+  const lc = email.toLowerCase();
+  const existing = [...state.users.values()].find((u) => u.role === "staff" && u.email === lc);
+  if (!existing) {
+    const user = {
+      id: uuid(),
+      email: lc,
+      name: "Shop Owner",
+      role: "staff",
+      passwordHash: hashPassword(password),
+      status: "approved",
+      emailVerified: true,
+      createdAt: now()
+    };
+    state.users.set(user.id, user);
+    console.log(`[store] bootstrap staff account created: ${lc}`);
+  } else if (!verifyPassword(password, existing.passwordHash)) {
+    existing.passwordHash = hashPassword(password);
+    console.log("[store] bootstrap staff password synced from env");
+  }
 }
 function publicUser(u) {
   if (!u) return null;
